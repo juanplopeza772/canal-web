@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Canal</title>
+<style>
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0b0e14;color:#e6e9ef;display:flex;flex-direction:column;align-items:center;min-height:100vh}
+  header{padding:18px;font-size:18px;letter-spacing:.5px;color:#9aa4b2}
+  #status{margin:10px 0;color:#8ab4f8;min-height:22px;font-size:14px}
+  button{background:#1a73e8;color:#fff;border:0;border-radius:8px;padding:14px 26px;font-size:16px;cursor:pointer;margin:8px}
+  button.sec{background:#2b3242}
+  button:disabled{opacity:.5;cursor:default}
+  #tiles{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;margin:14px;max-width:1000px}
+  video{width:320px;max-width:44vw;background:#000;border-radius:10px}
+  #rec{display:none;color:#ff5c5c;font-weight:600;margin-top:6px}
+</style>
+</head>
+<body>
+<header>CANAL</header>
+<div id="status">Listo.</div>
+<div>
+  <button id="join">Entrar al canal</button>
+  <button id="leave" class="sec" disabled>Terminar y descargar grabación</button>
+</div>
+<div id="rec">● Grabando</div>
+<div id="tiles"></div>
+<script src="https://cdn.jsdelivr.net/npm/livekit-client@2.15.4/dist/livekit-client.umd.min.js"></script>
+<script>
+const TOKEN_SERVER_ID = new URLSearchParams(location.hash.slice(1)).get('clave') || '';
+const AGENT_NAME = 'assistant-147d';
+const ROOM_NAME = 'canal';
+const statusEl = document.getElementById('status');
+const joinBtn = document.getElementById('join');
+const leaveBtn = document.getElementById('leave');
+const recEl = document.getElementById('rec');
+const tiles = document.getElementById('tiles');
+let room, recorder, chunks = [], audioCtx, mixDest, micStream, leaving = false;
+
+function setStatus(t){ statusEl.textContent = t; }
+
+async function getConnection(){
+  const r = await fetch('https://cloud-api.livekit.io/api/v2/sandbox/connection-details', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Sandbox-ID': TOKEN_SERVER_ID },
+    body: JSON.stringify({
+      room_name: ROOM_NAME,
+      participant_name: 'usuario-' + Math.floor(Math.random()*10000),
+      room_config: { agents: [{ agent_name: AGENT_NAME }] }
+    })
+  });
+  if (!r.ok) throw new Error('token server ' + r.status);
+  const d = await r.json();
+  return { serverUrl: d.server_url, participantToken: d.participant_token };
+}
+
+function addVideo(track, id){
+  const v = document.createElement('video');
+  v.id = id; v.autoplay = true; v.playsInline = true;
+  if (id === 'local') v.muted = true;
+  track.attach(v);
+  tiles.appendChild(v);
+}
+
+async function startRecording(){
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  mixDest = audioCtx.createMediaStreamDestination();
+  if (micStream) audioCtx.createMediaStreamSource(micStream).connect(mixDest);
+  if (room) room.remoteParticipants.forEach(p => {
+    p.audioTrackPublications.forEach(pub => {
+      if (pub.track && pub.track.attachedElements && pub.track.attachedElements.length){
+        try { audioCtx.createMediaStreamSource(pub.track.attachedElements[0].captureStream()).connect(mixDest); } catch(e){}
+      }
+    });
+  });
+  const tracks = [];
+  if (room && room.localParticipant){
+    const cam = room.localParticipant.getTrackPublication('camera');
+    if (cam && cam.track) tracks.push(cam.track.mediaStreamTrack);
+  }
+  tracks.push(mixDest.stream.getAudioTracks()[0]);
+  const out = new MediaStream(tracks);
+  let mime = 'video/webm;codecs=vp9,opus';
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm;codecs=vp8,opus';
+  if (!MediaRecorder.isTypeSupported(mime)) mime = 'video/webm';
+  recorder = new MediaRecorder(out, { mimeType: mime, videoBitsPerSecond: 1500000 });
+  recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = downloadRecording;
+  recorder.start(5000);
+  recEl.style.display = 'block';
+}
+
+function downloadRecording(){
+  const blob = new Blob(chunks, { type: 'video/webm' });
+  const a = document.createElement('a');
+  const stamp = new Date().toISOString().replace(/[:T]/g,'-').slice(0,19);
+  a.href = URL.createObjectURL(blob);
+  a.download = 'canal-' + stamp + '.webm';
+  document.body.appendChild(a); a.click(); a.remove();
+  setStatus('Grabación descargada. Puedes volver a entrar cuando quieras.');
+}
+
+async function join(){
+  joinBtn.disabled = true;
+  setStatus('Conectando...');
+  if (!TOKEN_SERVER_ID) {
+    setStatus('Enlace incompleto: este enlace no tiene la clave del canal. Pídela de nuevo completa.');
+    joinBtn.disabled = false;
+    return;
+  }
+  try {
+    const conn = await getConnection();
+    room = new LivekitClient.Room({ adaptiveStream: true, dynacast: true });
+    room.on('trackSubscribed', (track, pub, participant) => {
+      if (track.kind === 'video') addVideo(track, 'remote-' + participant.identity);
+      if (track.kind === 'audio') {
+        const el = track.attach();
+        document.body.appendChild(el);
+        if (audioCtx && mixDest) { try { audioCtx.createMediaStreamSource(el.captureStream()).connect(mixDest); } catch(e){} }
+      }
+    });
+    room.on('trackUnsubscribed', track => track.detach().forEach(el => el.remove()));
+    room.on('disconnected', () => { if (!leaving) setStatus('Desconectado.'); });
+    await room.connect(conn.serverUrl, conn.participantToken);
+    setStatus('Conectado. Permite el micrófono cuando el navegador lo pida...');
+    let micOk = false;
+    try {
+      const enabled = await Promise.race([
+        room.localParticipant.setMicrophoneEnabled(true).then(()=>true),
+        new Promise(r => setTimeout(() => r(false), 20000))
+      ]);
+      if (enabled) {
+        const pub = room.localParticipant.getTrackPublication('microphone');
+        if (pub && pub.track) { micStream = new MediaStream([pub.track.mediaStreamTrack]); micOk = true; }
+      }
+    } catch(e){ /* sin micrófono, seguimos en modo escucha */ }
+    try {
+      const camOn = await Promise.race([
+        room.localParticipant.setCameraEnabled(true).then(()=>true),
+        new Promise(r => setTimeout(() => r(false), 15000))
+      ]);
+      if (camOn) {
+        const cam = room.localParticipant.getTrackPublication('camera');
+        if (cam && cam.track) addVideo(cam.track, 'local');
+      }
+    } catch(e){ /* sin cámara, seguimos con audio */ }
+    setStatus(micOk ? 'En el canal. El asistente se une en unos segundos.'
+                    : 'En el canal sin micrófono: puedes escuchar al asistente pero no hablar. La grabación igual funciona.');
+    leaveBtn.disabled = false;
+    await startRecording();
+  } catch(e){
+    setStatus('Error: ' + (e && e.message ? e.message : e));
+    joinBtn.disabled = false;
+  }
+}
+
+async function leave(){
+  leaveBtn.disabled = true;
+  leaving = true;
+  try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch(e){}
+  try { if (room) await room.disconnect(); } catch(e){}
+  recEl.style.display = 'none';
+  setStatus(recorder ? 'Grabación descargada. Puedes volver a entrar cuando quieras.' : 'Desconectado.');
+  joinBtn.disabled = false;
+  leaving = false;
+}
+
+joinBtn.onclick = join;
+leaveBtn.onclick = leave;
+window.addEventListener('beforeunload', () => { try { if (recorder && recorder.state !== 'inactive') recorder.stop(); } catch(e){} });
+</script>
+</body>
+</html>
